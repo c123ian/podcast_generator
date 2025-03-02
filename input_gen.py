@@ -6,9 +6,8 @@ from typing import Optional
 import torch
 from fasthtml.common import (
     fast_app, H1, P, Div, Form, Input, Button, Group,
-    Title, Main
+    Title, Main, Audio, Script, H2, A
 )
-
 # Core PDF support - required
 import PyPDF2
 
@@ -16,6 +15,21 @@ import PyPDF2
 import whisper
 
 from langchain_community.document_loaders import WebBaseLoader
+
+from langchain_community.document_loaders import WebBaseLoader
+from common_image import common_image, shared_volume
+
+
+import modal
+
+# Ensure these functions reference the correct deployed app
+generate_script = modal.Function.from_name("multi-file-podcast", "generate_script")
+generate_audio = modal.Function.from_name("multi-file-podcast", "generate_audio")
+
+
+# HELPER CLASSES
+
+
 
 class BaseIngestor:
     """Base class for all ingestors"""
@@ -128,40 +142,67 @@ class IngestorFactory:
         else:
             print(f"Unsupported input type: {input_type}")
             return None
+        
+class TextIngestor(BaseIngestor):
+    """Simple ingestor for .txt or .md files."""
+    def validate(self, file_path: str) -> bool:
+        if not os.path.isfile(file_path):
+            print(f"Error: File not found at path: {file_path}")
+            return False
+        if not (file_path.lower().endswith('.txt') or file_path.lower().endswith('.md')):
+            print("Error: File is not .txt or .md")
+            return False
+        return True
 
-# Create Modal app and configure image
+    def extract_text(self, file_path: str, max_chars: int = 100000) -> Optional[str]:
+        if not self.validate(file_path):
+            return None
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                text = f.read()
+            if len(text) > max_chars:
+                print(f"Truncating text to {max_chars} chars")
+                text = text[:max_chars]
+            print(f"Extracted text from: {file_path}")
+            return text
+        except Exception as e:
+            print(f"Error reading text file: {e}")
+            return None
+
+
+class IngestorFactory:
+    @staticmethod
+    def get_ingestor(input_type: str, **kwargs) -> Optional[BaseIngestor]:
+        input_type = input_type.lower()
+        if input_type == "pdf":
+            return PDFIngestor()
+        elif input_type == "website":
+            return WebsiteIngestor()
+        elif input_type == "audio":
+            return AudioIngestor(**kwargs)
+        elif input_type == "text":
+            return TextIngestor()  # <-- new line here
+        else:
+            print(f"Unsupported input type: {input_type}")
+            return None
+        
+# Create Modal App
 app = modal.App("content_injection")
 
-image = (
-    modal.Image.debian_slim(python_version="3.10")
-    .apt_install("git")
-    .pip_install(
-        "PyPDF2",
-        "python-fasthtml==0.12.0",
-        "langchain",
-        "langchain-community",
-        "openai-whisper",
-        "beautifulsoup4",
-        "requests",
-        "pydub"
-    )
-)
-
-# Create/lookup volume for persistent storage
-try:
-    content_volume = modal.Volume.lookup("content_volume", create_if_missing=True)
-except modal.exception.NotFoundError:
-    content_volume = modal.Volume.persisted("content_volume")
-
+# Directories
 UPLOAD_DIR = "/data/uploads"
 OUTPUT_DIR = "/data/processed"
 DB_PATH = "/data/injections.db"
 
+# Ensure Directories Exist
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Setup Database
 def setup_database(db_path: str):
     """Initialize SQLite database for tracking injections"""
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS injections (
             id TEXT PRIMARY KEY,
@@ -173,14 +214,13 @@ def setup_database(db_path: str):
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    
     conn.commit()
     return conn
 
+# Determine Input Type
 def get_input_type(filename: str) -> str:
-    """Determine input type based on file extension or URL pattern"""
+    """Classifies input type based on filename or URL"""
     lower_filename = filename.lower()
-    
     if lower_filename.endswith('.pdf'):
         return 'pdf'
     elif lower_filename.endswith(('.mp3', '.wav', '.m4a', '.flac')):
@@ -192,40 +232,31 @@ def get_input_type(filename: str) -> str:
     else:
         raise ValueError(f"Unsupported file type: {filename}")
 
-def process_content(
-    source_path: str,
-    input_type: str,
-    max_chars: int = 100000
-) -> Optional[str]:
-    """Process content using appropriate ingestor"""
-    try:
-        ingestor = IngestorFactory.get_ingestor(input_type)
-        if not ingestor:
-            raise ValueError(f"No ingestor found for type: {input_type}")
-        
-        return ingestor.extract_text(source_path, max_chars)
-    except Exception as e:
-        print(f"Error processing content: {str(e)}")
+# Process Uploaded Content
+def process_content(source_path: str, input_type: str, max_chars: int = 100000) -> Optional[str]:
+    """Processes content using the appropriate ingestor"""
+    ingestor = IngestorFactory.get_ingestor(input_type)
+    if not ingestor:
+        print(f"❌ No ingestor found for type: {input_type}")
         return None
+    return ingestor.extract_text(source_path, max_chars)
 
+# Start Modal App with ASGI
 @app.function(
-    image=image,
+    image=common_image,
+    volumes={"/data": shared_volume},
     gpu=modal.gpu.T4(count=1),
-    volumes={"/data": content_volume},
     timeout=3600
 )
 @modal.asgi_app()
 def serve():
-    # Initialize directories and database
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    """Main FastHTML Server"""
     conn = setup_database(DB_PATH)
-    
     fasthtml_app, rt = fast_app()
-    
+
     @rt("/")
     def homepage():
-        """Render the upload form"""
+        """Render upload form with status checker"""
         upload_input = Input(
             type="file",
             name="content",
@@ -238,8 +269,8 @@ def serve():
             placeholder="Or enter website URL",
             cls="w-full px-3 py-2 border rounded"
         )
-        
-        form = Form(
+
+        upload_form = Form(
             Group(
                 upload_input,
                 url_input,
@@ -252,23 +283,42 @@ def serve():
             method="post",
         )
         
+        status_form = Form(
+            Group(
+                Input(
+                    type="text",
+                    name="injection_id",
+                    placeholder="Enter your podcast ID",
+                    cls="w-full px-3 py-2 border rounded"
+                ),
+                Button("Check Status"),
+                cls="space-y-4"
+            ),
+            action="/status-redirect",
+            method="get",
+        )
+
         return Title("Content Injection"), Main(
             H1("Upload Content for Podcast Generation"),
             P("Upload a file or provide a URL to process content for podcast generation."),
-            form,
-            Div(id="injection-status")
+            upload_form,
+            Div(id="injection-status"),
+            Div(
+                H1("Check Existing Podcast Status", cls="mt-8"),
+                P("Already have a podcast ID? Check its status:"),
+                status_form,
+                cls="mt-10 pt-8 border-t"
+            )
         )
-    
+
     @rt("/inject", methods=["POST"])
     async def inject_content(request):
-        """Handle content injection request"""
+        """Handles content ingestion and starts the podcast generation pipeline."""
         form = await request.form()
-        
-        # Generate unique ID for this injection
         injection_id = uuid.uuid4().hex
-        
+
         try:
-            # Handle file upload or URL
+            # Handle File Upload or URL
             if "content" in form and form["content"].filename:
                 file_field = form["content"]
                 original_filename = file_field.filename
@@ -284,81 +334,204 @@ def serve():
                 original_filename = url
             else:
                 return Div(
-                    P("Please select a file or provide a URL"),
+                    P("⚠️ Please select a file or provide a URL."),
                     id="injection-status",
                     cls="text-red-500"
                 )
-            
-            # Preview processed content
+
+            # Extract Text Content
             processed_text = process_content(save_path, input_type)
             if not processed_text:
                 return Div(
-                    P("Failed to process content"),
+                    P("❌ Failed to process content"),
                     id="injection-status",
                     cls="text-red-500"
                 )
-            
-            # Record injection in database
+
+            # Insert record into database
+            conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
             cursor.execute(
-                """
-                INSERT INTO injections (id, original_filename, input_type, status)
-                VALUES (?, ?, ?, 'processing')
-                """,
-                (injection_id, original_filename, input_type)
+                "INSERT INTO injections (id, original_filename, input_type, status) VALUES (?, ?, ?, ?)",
+                (injection_id, original_filename, input_type, "processing")
             )
             conn.commit()
+            conn.close()
+
+            # Call the Modal functions using `.remote(...)`
+            print("🚀 Kicking off script generation...")
+            script_pkl_path = generate_script.remote(processed_text)
+
+            print("🔊 Kicking off audio generation...")
+            # Generate the audio
+            audio_path = generate_audio.remote(script_pkl_path, injection_id)
             
-            # Process the content
-            processed_text = process_content(save_path, input_type)
-            if not processed_text:
-                raise Exception("Failed to process content")
-            
-            # Save processed text
-            output_path = os.path.join(OUTPUT_DIR, f"processed_{injection_id}.txt")
-            with open(output_path, "w", encoding="utf-8") as f:
-                f.write(processed_text)
-            
-            # Update database with success
-            cursor.execute(
-                """
-                UPDATE injections
-                SET status = 'completed', processed_path = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (output_path, injection_id)
-            )
-            conn.commit()
-            
+            # Create a status area that polls for updates using HTMX
             return Div(
-                P(f"✅ Content processed successfully! ID: {injection_id}"),
-                P(f"Output saved to: {output_path}"),
-                P("Preview:", cls="font-bold mt-4"),
-                P(processed_text, cls="font-mono text-sm whitespace-pre-wrap"),
+                P(f"✅ Content processed successfully! Your podcast is being generated."),
+                P(f"Your podcast ID: {injection_id}"),
+                Div(
+                    P("Checking status...", id="status-message"),
+                    # The magic is here - HTMX polling
+                    hx_get=f"/check-status-partial/{injection_id}",
+                    hx_trigger="load delay:5s, every 10s",
+                    hx_swap="innerHTML"
+                ),
                 id="injection-status",
                 cls="text-green-500"
             )
-            
+
         except Exception as e:
-            # Update database with error status
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                UPDATE injections
-                SET status = 'failed', updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (injection_id,)
-            )
-            conn.commit()
-            
             return Div(
-                P(f"Error processing content: {str(e)}"),
+                P(f"⚠️ Error processing content: {str(e)}"),
                 id="injection-status",
                 cls="text-red-500"
             )
+
+    @rt("/check-status-partial/{injection_id}")
+    async def check_status_partial(injection_id: str):
+        """Check status and return HTML partial for the status area"""
+        import base64
+        
+        # Check database for completion status
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT processed_path, status FROM injections WHERE id = ?", 
+            (injection_id,)
+        )
+        result = cursor.fetchone()
+        conn.close()
+        
+        if not result:
+            return Div(
+                P(f"No record found for ID: {injection_id}"),
+                cls="text-red-500"
+            )
+        
+        audio_path, status = result
+        
+        print(f"Status check for {injection_id}: path={audio_path}, status={status}")
+        
+        # If not completed yet, return status with continued polling
+        if status != "completed" or not audio_path:
+            return Div(
+                P(f"Your podcast is still being generated. Status: {status}"),
+                P("This will update automatically when ready."),
+                # Continue polling
+                hx_get=f"/check-status-partial/{injection_id}",
+                hx_trigger="every 10s",
+                hx_swap="innerHTML"
+            )
+        
+        # File is ready - display the audio player and stop polling
+        if audio_path and os.path.exists(audio_path):
+            try:
+                with open(audio_path, "rb") as f:
+                    audio_data = f.read()
+                    b64_audio = base64.b64encode(audio_data).decode("ascii")
+                    
+                return Div(
+                    H2("Your Podcast is Ready!"),
+                    P(f"ID: {injection_id}"),
+                    Audio(
+                        src=f"data:audio/wav;base64,{b64_audio}",
+                        controls=True,
+                        style="width: 100%;"
+                    )
+                    # No more hx_trigger to stop polling
+                )
+            except Exception as e:
+                print(f"Error for {injection_id}: {str(e)}")
+                return Div(
+                    P(f"Error loading audio file: {str(e)}"),
+                    cls="text-red-500"
+                    # Stop polling on error
+                )
+        else:
+            print(f"File not found at path: {audio_path}")
+            return Div(
+                P(f"Audio file not found. Status shows completed but file is missing."),
+                Button("Retry", hx_get=f"/check-status-partial/{injection_id}", hx_swap="innerHTML"),
+                cls="text-red-500"
+            )
     
+    @rt("/status/{injection_id}")
+    async def check_status(injection_id: str):
+        """Check status and display audio if ready"""
+        import base64
+        
+        # Check database for completion status
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT processed_path, status FROM injections WHERE id = ?", 
+            (injection_id,)
+        )
+        result = cursor.fetchone()
+        conn.close()
+        
+        if not result:
+            return Title("Podcast Status"), Main(
+                H1("Podcast Status"),
+                P(f"No record found for ID: {injection_id}"),
+                cls="text-red-500"
+            )
+        
+        audio_path, status = result
+        
+        if status != "completed" or not audio_path:
+            # If still processing, show status with auto-updating div
+            return Title("Podcast Status"), Main(
+                H1("Podcast Status"),
+                Div(
+                    P(f"Your podcast is still being generated. Status: {status}"),
+                    P("This page will automatically update when ready."),
+                    # Add HTMX polling
+                    hx_get=f"/check-status-partial/{injection_id}",
+                    hx_trigger="load delay:1s, every 10s",
+                    hx_swap="outerHTML"
+                )
+            )
+        
+        # File is ready - display the audio player
+        if audio_path and os.path.exists(audio_path):
+            try:
+                with open(audio_path, "rb") as f:
+                    audio_data = f.read()
+                    b64_audio = base64.b64encode(audio_data).decode("ascii")
+                    
+                return Title("Your Podcast"), Main(
+                    H1("Your Podcast is Ready!"),
+                    P(f"ID: {injection_id}"),
+                    Audio(
+                        src=f"data:audio/wav;base64,{b64_audio}",
+                        controls=True,
+                        style="width: 100%;"
+                    )
+                )
+            except Exception as e:
+                return Title("Error"), Main(
+                    H1("Error"),
+                    P(f"Error loading audio file: {str(e)}"),
+                    cls="text-red-500"
+                )
+        else:
+            return Title("File Not Found"), Main(
+                H1("File Not Found"),
+                P(f"Audio file not found at expected location: {audio_path}"),
+                Button("Retry", hx_get=f"/status/{injection_id}"),
+                cls="text-red-500"
+            )
+
+    @rt("/status-redirect")
+    def status_redirect(injection_id: str):
+        """Redirect to the status page for an ID"""
+        from starlette.responses import RedirectResponse
+        return RedirectResponse(f"/status/{injection_id}")
+
     return fasthtml_app
 
 if __name__ == "__main__":
-    serve()
+    with modal.app.run():
+        serve()  # Starts the FastHTML server with the correct function references
